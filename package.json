@@ -1,0 +1,30 @@
+{
+  "name": "pi-plan-mode",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Grill-first planning mode for Pi — /plan tools TUI, two-phase grill→compose, fixed-template validation with retry",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Insanitier/pi-plan-mode.git"
+  },
+  "homepage": "https://github.com/Insanitier/pi-plan-mode#readme",
+  "keywords": ["pi-package"],
+  "engines": { "node": ">=20 <26" },
+  "files": ["extensions"],
+  "pi": {
+    "extensions": ["./extensions/plan-mode.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.78.1",
+    "typebox": ">=1.1.24"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.78.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
