@@ -28,6 +28,7 @@ const STATUS_KEY = "plan-mode";
 const WIDGET_KEY = "plan-mode";
 
 const PLAN_MODE_QUESTION_TOOL = "plan_mode_question";
+const PLAN_MODE_READY_TOOL = "plan_mode_ready_to_compose";
 const PROPOSED_PLAN_RE = /<proposed_plan>([\s\S]*?)<\/proposed_plan>/i;
 const TOOL_SELECTOR_PAGE_SIZE = 10;
 const GRILLING_SKILL_PATH = join(homedir(), ".pi", "agent", "skills", "grilling", "SKILL.md");
@@ -42,7 +43,7 @@ const DESTRUCTIVE_RE = /\b(rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|tee|dd|sudo
 
 interface PlanModeState {
   enabled: boolean;
-  phase: "grill" | "compose" | null;
+  phase: "grill" | "awaiting_compose_confirmation" | "compose" | null;
   latestPlan: string | null;
   awaitingAction: boolean;
   selectedToolNames?: string[];
@@ -71,7 +72,7 @@ Plan-mode rules:
 - The number of questions is not capped: keep asking one at a time until important uncertainty is resolved.
 - Only ask about things that materially affect the plan: scope, approach, tradeoffs, constraints, preferences.
 - If a question can be answered by exploring the codebase (reading files, searching config, checking packages), explore first instead of asking.
-- Do NOT produce a <proposed_plan> block yet. The user must confirm before compose phase starts.`;
+- Do NOT produce a <proposed_plan> block yet. When no important uncertainty remains, call <tool>plan_mode_ready_to_compose</tool>. The user can also type /plan compose to start compose phase.`;
 }
 
 /** Compose prompt — fixed template, lean and complete */
@@ -136,7 +137,6 @@ function hasPlanContext(msg: unknown): boolean {
 export default function (pi: ExtensionAPI) {
   let state: PlanModeState = { enabled: false, phase: null, latestPlan: null, awaitingAction: false };
   let toolsBeforePlan: string[] | undefined;
-  let askedQuestionThisRun = false;
 
   // ── Flags ──────────────────────────────────────────────────────────────────
 
@@ -181,7 +181,6 @@ export default function (pi: ExtensionAPI) {
       if (!ctx.hasUI) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ cancelled: true, reason: "ui_unavailable" }) }] };
       }
-      askedQuestionThisRun = true;
 
       const choices = q.options.map((o, i) => `${i + 1}. ${o.label} — ${o.description}`);
       const other = `${q.options.length + 1}. Other (type your own)`;
@@ -207,6 +206,31 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: plan_mode_ready_to_compose (explicit grill → compose gate) ───────
+  pi.registerTool({
+    name: PLAN_MODE_READY_TOOL,
+    label: "Ready to compose",
+    description: "Call when grill-phase uncertainty is resolved and you are ready to ask the user for compose-phase confirmation.",
+    promptSnippet: "Ask the user to confirm that plan grilling is complete before composing the plan",
+    promptGuidelines: [
+      "Use plan_mode_ready_to_compose only after material planning uncertainty is resolved.",
+      "Do not write a proposed plan before plan_mode_ready_to_compose or /plan compose moves Plan mode into compose phase.",
+    ],
+    parameters: Type.Object({
+      reason: Type.Optional(Type.String({ description: "Brief reason the grill phase appears complete" })),
+    }),
+    async execute(_toolCallId: string, params: unknown, _signal: AbortSignal, _onUpdate: unknown, ctx: ExtensionContext) {
+      if (!state.enabled || state.phase !== "grill") {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, reason: "not_in_grill_phase" }) }] };
+      }
+      const reason = (params as { reason?: string } | undefined)?.reason;
+      const confirmed = await requestComposeConfirmation(ctx, reason);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ ok: true, confirmed }) }],
+        terminate: true,
+      };
+    },
+  });
   // ── Command: /plan ─────────────────────────────────────────────────────────
 
   pi.registerCommand("plan", {
@@ -217,6 +241,12 @@ export default function (pi: ExtensionAPI) {
       if (trimmed === "exit" || trimmed === "off") {
         exitPlanMode(ctx);
         ctx.ui.notify("Plan mode disabled.", "info");
+        return;
+      }
+
+      if (trimmed === "compose") {
+        if (!state.enabled) enterPlanMode(ctx);
+        beginCompose(ctx);
         return;
       }
 
@@ -267,9 +297,6 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_start", () => {
-    askedQuestionThisRun = false;
-  });
 
   // Inject phase-specific prompt before agent start
   pi.on("before_agent_start", (event, ctx) => {
@@ -282,80 +309,56 @@ export default function (pi: ExtensionAPI) {
     return { systemPrompt: `${event.systemPrompt}\n\n${grillPrompt()}` };
   });
 
-  // Detect proposed plan / manage transitions
+  // Detect proposed plan / manage compose validation
   pi.on("agent_end", async (event, ctx) => {
     if (!state.enabled) return;
     const text = latestAssistantText(event.messages);
-
-    // ── If a proposed plan is detected ────────────────────────────────────
     const match = PROPOSED_PLAN_RE.exec(text);
-    if (match) {
-      if (state.phase !== "compose") {
-        setTimeout(() => {
-          if (!state.enabled || state.phase !== "grill") return;
-          pi.sendUserMessage("You wrote a plan before the user confirmed the grill phase is complete. Continue the grill phase: ask the next important one-at-a-time question, or state that no material uncertainty remains.", { deliverAs: "followUp" });
-        }, 0);
-        return;
-      }
 
-      const plan = match[1].trim();
-      const validationError = validatePlan(plan);
-
-      if (validationError) {
-        requestComposeRetry(ctx, validationError);
-        return;
-      }
-
-      // Valid plan
-      state.latestPlan = plan;
-      state.awaitingAction = true;
-      persistState();
-      updateUi(ctx);
-
-      setTimeout(async () => {
-        if (!state.enabled || !state.latestPlan) return;
-        if (ctx.hasUI) {
-          const choice = await ctx.ui.select("Plan ready — what next?", [
-            "Implement this plan",
-            "Stay in Plan mode",
-            "Exit Plan mode (discard plan)",
-          ]);
-          if (choice === "Implement this plan") startImplementation(ctx);
-          else if (choice === "Exit Plan mode (discard plan)") exitPlanMode(ctx);
-        }
-        pi.sendMessage(
-          { customType: "proposed-plan", content: `**Proposed Plan**\n\n${state.latestPlan}`, display: true },
-          { triggerTurn: false },
-        );
-      }, 0);
-      return;
-    }
-
-    // ── Grill → compose transition ──────────────────────────────────────
-    if (state.phase === "grill" && !state.latestPlan) {
-      // If agent asked questions this turn, wait for more — don't prompt yet
-      if (askedQuestionThisRun) return;
-
-      setTimeout(async () => {
+    if (state.phase === "grill" && match) {
+      setTimeout(() => {
         if (!state.enabled || state.phase !== "grill") return;
-        if (!ctx.hasUI) { state.phase = "compose"; persistState(); updateUi(ctx); return; }
-        const proceed = await ctx.ui.confirm("Questions done?", "Proceed to compose phase — write the plan in fixed template?");
-        if (proceed) {
-          state.phase = "compose";
-          persistState();
-          updateUi(ctx);
-          ctx.ui.notify("Compose phase — write plan in fixed template.", "info");
-          pi.sendUserMessage("Proceed to write the plan using the fixed template.", { deliverAs: "followUp" });
-        } else {
-          pi.sendUserMessage("Continue the grill phase. Ask the next important one-at-a-time question, or explore the codebase first if the answer is discoverable.", { deliverAs: "followUp" });
-        }
+        pi.sendUserMessage("Still in grill phase. Do not write the plan yet. If uncertainty is resolved, call plan_mode_ready_to_compose; the user can also type /plan compose.", { deliverAs: "followUp" });
       }, 0);
       return;
     }
 
-    if (state.phase === "compose" && !state.latestPlan) {
-      requestComposeRetry(ctx, "Missing <proposed_plan>...</proposed_plan> block.");
+    if (!match) {
+      if (state.phase === "compose" && !state.latestPlan) {
+        requestComposeRetry(ctx, "Missing <proposed_plan>...</proposed_plan> block.");
+      }
+      return;
     }
+
+    const plan = match[1].trim();
+    const validationError = validatePlan(plan);
+
+    if (validationError) {
+      requestComposeRetry(ctx, validationError);
+      return;
+    }
+
+    state.latestPlan = plan;
+    state.awaitingAction = true;
+    persistState();
+    updateUi(ctx);
+
+    setTimeout(async () => {
+      if (!state.enabled || !state.latestPlan) return;
+      if (ctx.hasUI) {
+        const choice = await ctx.ui.select("Plan ready — what next?", [
+          "Implement this plan",
+          "Stay in Plan mode",
+          "Exit Plan mode (discard plan)",
+        ]);
+        if (choice === "Implement this plan") startImplementation(ctx);
+        else if (choice === "Exit Plan mode (discard plan)") exitPlanMode(ctx);
+      }
+      pi.sendMessage(
+        { customType: "proposed-plan", content: `**Proposed Plan**\n\n${state.latestPlan}`, display: true },
+        { triggerTurn: false },
+      );
+    }, 0);
   });
 
   // Filter stale plan messages when not in plan mode
@@ -394,16 +397,54 @@ export default function (pi: ExtensionAPI) {
     else pi.sendUserMessage(msg, { deliverAs: "followUp" });
   }
 
+  function beginCompose(ctx: ExtensionContext) {
+    state.phase = "compose";
+    persistState();
+    updateUi(ctx);
+    ctx.ui.notify("Compose phase — write plan in fixed template.", "info");
+    const msg = `Proceed to write the plan using the fixed template below.\n\n${composePrompt(null)}`;
+    if (ctx.isIdle()) pi.sendUserMessage(msg);
+    else pi.sendUserMessage(msg, { deliverAs: "followUp" });
+  }
+
+  async function requestComposeConfirmation(ctx: ExtensionContext, reason?: string) {
+    if (!ctx.hasUI) {
+      beginCompose(ctx);
+      return true;
+    }
+
+    state.phase = "awaiting_compose_confirmation";
+    persistState();
+    updateUi(ctx);
+
+    const detail = reason ? `\n\nReason: ${reason}` : "";
+    const proceed = await ctx.ui.confirm("Questions done?", `Proceed to compose phase — write the plan in fixed template?${detail}`);
+    if (proceed) {
+      beginCompose(ctx);
+      return true;
+    }
+
+    state.phase = "grill";
+    persistState();
+    updateUi(ctx);
+    const msg = "Continue the grill phase. Ask the next important one-at-a-time question, or explore the codebase first if the answer is discoverable.";
+    if (ctx.isIdle()) pi.sendUserMessage(msg);
+    else pi.sendUserMessage(msg, { deliverAs: "followUp" });
+    return false;
+  }
+
   async function showPlanMenu(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
     const options = state.latestPlan
       ? ["Show plan", "Implement this plan", "Configure tools", "Stay in Plan mode", "Exit Plan mode"]
-      : ["Configure tools", "Stay in Plan mode", "Exit Plan mode"];
+      : ["Compose plan", "Configure tools", "Stay in Plan mode", "Exit Plan mode"];
     const choice = await ctx.ui.select(state.latestPlan ? "Plan ready. What next?" : "What next?", options);
     if (choice === "Show plan" && state.latestPlan) {
       ctx.ui.notify(state.latestPlan, "info");
     } else if (choice === "Implement this plan") {
       startImplementation(ctx);
+    } else if (choice === "Compose plan") {
+      beginCompose(ctx);
     } else if (choice === "Configure tools") {
       await showToolSelector(ctx);
     } else if (choice === "Exit Plan mode") {
@@ -469,7 +510,7 @@ export default function (pi: ExtensionAPI) {
   function selectableTools(): ToolInfo[] {
     try {
       return pi.getAllTools()
-        .filter((t) => t.name !== PLAN_MODE_QUESTION_TOOL)
+        .filter((t) => t.name !== PLAN_MODE_QUESTION_TOOL && t.name !== PLAN_MODE_READY_TOOL)
         .sort((a, b) => {
           const aB = isBuiltin(a), bB = isBuiltin(b);
           if (aB !== bB) return aB ? -1 : 1;
@@ -484,7 +525,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function isBlockedTool(name: string): boolean {
-    return BLOCKED_BUILTIN_NAMES.has(name) || name === PLAN_MODE_QUESTION_TOOL;
+    return BLOCKED_BUILTIN_NAMES.has(name) || name === PLAN_MODE_QUESTION_TOOL || name === PLAN_MODE_READY_TOOL;
   }
 
   function isBuiltin(t: ToolInfo): boolean {
@@ -513,19 +554,19 @@ export default function (pi: ExtensionAPI) {
 
   function applySelectedTools(allTools: ToolInfo[], selectedNames: string[]) {
     const selectable = new Set(selectedNames.filter((n) => allTools.some((t) => t.name === n) && !isBlockedTool(n)));
-    const tools = [...selectable, PLAN_MODE_QUESTION_TOOL].sort();
+    const tools = [...selectable, PLAN_MODE_QUESTION_TOOL, PLAN_MODE_READY_TOOL].sort();
     pi.setActiveTools(tools);
   }
 
   function restoreTools() {
     const tools = toolsBeforePlan ?? state.toolsBeforePlan ?? FULL_TOOLS;
-    pi.setActiveTools(tools.filter((t) => t !== PLAN_MODE_QUESTION_TOOL));
+    pi.setActiveTools(tools.filter((t) => t !== PLAN_MODE_QUESTION_TOOL && t !== PLAN_MODE_READY_TOOL));
     toolsBeforePlan = undefined;
   }
 
   function removePlanQuestionTool() {
     const active = safeGetActiveTools();
-    const filtered = active.filter((t) => t !== PLAN_MODE_QUESTION_TOOL);
+    const filtered = active.filter((t) => t !== PLAN_MODE_QUESTION_TOOL && t !== PLAN_MODE_READY_TOOL);
     if (filtered.length !== active.length) pi.setActiveTools(filtered);
   }
 
@@ -546,7 +587,7 @@ export default function (pi: ExtensionAPI) {
       if (!state.enabled || state.phase !== "compose") return;
       ctx.ui.notify(`Plan validation: ${validationError}. Retrying...`, "warning");
       pi.sendUserMessage(
-        `The plan was incomplete. Fix this issue and rewrite with the exact template:\n${validationError}`,
+        `The plan was incomplete. Fix this issue and rewrite with the exact template below.\n\n${composePrompt(validationError)}`, 
         { deliverAs: "followUp" },
       );
     }, 0);
@@ -573,7 +614,7 @@ export default function (pi: ExtensionAPI) {
 
   function updateUi(ctx: ExtensionContext) {
     if (state.enabled) {
-      const phaseLabel = state.phase === "compose" ? "composing" : "grilling";
+      const phaseLabel = state.phase === "compose" ? "composing" : state.phase === "awaiting_compose_confirmation" ? "confirming" : "grilling";
       ctx.ui.setStatus(STATUS_KEY, state.latestPlan ? "📝 plan ready" : `📝 plan ${phaseLabel}`);
       if (state.latestPlan) {
         ctx.ui.setWidget(WIDGET_KEY, ["Proposed plan ready. Use /plan to review, implement, or exit."]);
