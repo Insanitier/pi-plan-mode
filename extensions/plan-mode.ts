@@ -46,6 +46,7 @@ interface PlanModeState {
   latestPlan: string | null;
   awaitingAction: boolean;
   selectedToolNames?: string[];
+  knownToolNames?: string[];
   toolsBeforePlan?: string[];
 }
 
@@ -242,10 +243,9 @@ export default function (pi: ExtensionAPI) {
     if (pi.getFlag("plan") === true && !state.enabled) {
       state = { enabled: true, phase: "grill", latestPlan: null, awaitingAction: false, toolsBeforePlan: safeGetActiveTools() };
       toolsBeforePlan = state.toolsBeforePlan;
-      setPlanTools(ctx);
-      updateUi(ctx);
     }
-    if (!state.enabled) removePlanQuestionTool();
+    if (state.enabled) setPlanTools(ctx);
+    else removePlanQuestionTool();
     updateUi(ctx);
   });
 
@@ -272,8 +272,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Inject phase-specific prompt before agent start
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
     if (!state.enabled) return;
+    setPlanTools(ctx);
     state.awaitingAction = false;
     if (state.phase === "compose") {
       return { systemPrompt: `${event.systemPrompt}\n\n${composePrompt(null)}` };
@@ -367,8 +368,9 @@ export default function (pi: ExtensionAPI) {
 
   function enterPlanMode(ctx: ExtensionContext) {
     const selectedToolNames = state.selectedToolNames;
+    const knownToolNames = state.knownToolNames;
     if (!state.enabled) toolsBeforePlan = safeGetActiveTools();
-    state = { enabled: true, phase: "grill", latestPlan: null, awaitingAction: false, selectedToolNames, toolsBeforePlan };
+    state = { enabled: true, phase: "grill", latestPlan: null, awaitingAction: false, selectedToolNames, knownToolNames, toolsBeforePlan };
     setPlanTools(ctx);
     persistState();
     updateUi(ctx);
@@ -376,7 +378,8 @@ export default function (pi: ExtensionAPI) {
 
   function exitPlanMode(ctx: ExtensionContext) {
     const selectedToolNames = state.selectedToolNames;
-    state = { enabled: false, phase: null, latestPlan: null, awaitingAction: false, selectedToolNames };
+    const knownToolNames = state.knownToolNames;
+    state = { enabled: false, phase: null, latestPlan: null, awaitingAction: false, selectedToolNames, knownToolNames };
     restoreTools();
     persistState();
     updateUi(ctx);
@@ -413,6 +416,7 @@ export default function (pi: ExtensionAPI) {
 
   async function showToolSelector(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
+    setPlanTools(ctx);
     const allTools = selectableTools();
     if (allTools.length === 0) {
       ctx.ui.notify("No tools available.", "info");
@@ -455,6 +459,7 @@ export default function (pi: ExtensionAPI) {
       else selected.add(toolName);
 
       state.selectedToolNames = [...selected].sort();
+      state.knownToolNames = allTools.map((t) => t.name).sort();
       applySelectedTools(allTools, state.selectedToolNames);
       persistState();
       updateUi(ctx);
@@ -495,9 +500,15 @@ export default function (pi: ExtensionAPI) {
 
   function setPlanTools(ctx: ExtensionContext) {
     const allTools = selectableTools();
-    const names = state.selectedToolNames ?? defaultSelectedNames(allTools);
-    state.selectedToolNames = names;
-    applySelectedTools(allTools, names);
+    const allNames = allTools.map((t) => t.name).sort();
+    const defaults = defaultSelectedNames(allTools);
+    const known = new Set(state.knownToolNames ?? []);
+    const names = state.selectedToolNames
+      ? [...new Set([...state.selectedToolNames, ...defaults.filter((name) => !known.has(name))])]
+      : defaults;
+    state.selectedToolNames = names.sort();
+    state.knownToolNames = allNames;
+    applySelectedTools(allTools, state.selectedToolNames);
   }
 
   function applySelectedTools(allTools: ToolInfo[], selectedNames: string[]) {
@@ -551,6 +562,7 @@ export default function (pi: ExtensionAPI) {
         latestPlan: entry.data.latestPlan ?? null,
         awaitingAction: entry.data.awaitingAction ?? false,
         selectedToolNames: entry.data.selectedToolNames,
+        knownToolNames: entry.data.knownToolNames,
         toolsBeforePlan: entry.data.toolsBeforePlan,
       };
       toolsBeforePlan = entry.data.toolsBeforePlan;
