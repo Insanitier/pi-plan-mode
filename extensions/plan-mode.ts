@@ -16,7 +16,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -29,7 +29,7 @@ const WIDGET_KEY = "plan-mode";
 
 const PLAN_MODE_QUESTION_TOOL = "plan_mode_question";
 const PLAN_MODE_READY_TOOL = "plan_mode_ready_to_compose";
-const PROPOSED_PLAN_RE = /<proposed_plan>([\s\S]*?)<\/proposed_plan>/i;
+const PLAN_ONLY_TOOLS = [PLAN_MODE_QUESTION_TOOL, PLAN_MODE_READY_TOOL, "submit_plan"];
 const TOOL_SELECTOR_PAGE_SIZE = 10;
 const GRILLING_SKILL_PATH = join(homedir(), ".pi", "agent", "skills", "grilling", "SKILL.md");
 
@@ -80,50 +80,19 @@ function composePrompt(retryProblem: string | null): string {
   const emphasis = retryProblem ? `\n\nYour previous output had issues. Fix them now:\n${retryProblem}` : "";
   return `[PLAN MODE — COMPOSE PHASE]
 
-Now write the implementation plan using the EXACT template below. Every section is required and must be non-empty.${emphasis}
-
-<proposed_plan>
-# Title
-
-## Summary
-One paragraph describing what this plan accomplishes.
-
-## Key Changes
-- File/area: what changes, and why
-- File/area: what changes, and why
-
-## Test Plan
-How to verify the implementation works.
-
-## Assumptions
-What you assumed about the environment, dependencies, or user intent.
-</proposed_plan>
+Now call the <tool>submit_plan</tool> tool with your plan.
+Do NOT output markdown or <proposed_plan> tags — only call the tool.
 
 Rules:
-- Use the EXACT <proposed_plan> tags and template structure above.
-- Be specific about files and changes. No placeholders.
-- Do NOT suggest implementation — this is the plan.
-- Keep it concise but decision-complete.`;
+- Every task must have a concrete action with exact commands/tools.
+- Every task must list the files it touches in target_files.
+- Vague actions like "check", "review", "look into" are rejected by validation.
+- Be specific and decision-complete.${emphasis}`;
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
 
-const REQUIRED_SECTIONS = ["Summary", "Key Changes", "Test Plan", "Assumptions"];
 
-function validatePlan(text: string): string | null {
-  if (!text.includes("## Summary")) return "Missing section: ## Summary";
-  if (!text.includes("## Key Changes")) return "Missing section: ## Key Changes";
-  if (!text.includes("## Test Plan")) return "Missing section: ## Test Plan";
-  if (!text.includes("## Assumptions")) return "Missing section: ## Assumptions";
-  // Check each section has content beyond the header
-  for (const section of REQUIRED_SECTIONS) {
-    const parts = text.split(`## ${section}`);
-    if (parts.length < 2) return `Empty section: ## ${section}`;
-    const afterHeader = parts[1].split("\n## ")[0].trim();
-    if (!afterHeader) return `Empty section: ## ${section}`;
-  }
-  return null; // valid
-}
 
 // ─── Helper: filter messages with plan context ───────────────────────────────
 
@@ -231,6 +200,92 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
+  // ── Tool: submit_plan (structured plan submission, replaces proposed_plan tags) ──
+
+  const SUBMIT_PLAN_TOOL = "submit_plan";
+
+  pi.registerTool({
+    name: SUBMIT_PLAN_TOOL,
+    label: "Submit plan",
+    description: "Submit a structured implementation plan after grill phase. Only available in compose phase.",
+    promptSnippet: "Submit a structured plan with tasks, files, and verification steps",
+    promptGuidelines: [
+      "Use submit_plan only in compose phase — never in grill phase.",
+      "Every task must have concrete action commands, specific target files, and clear verification.",
+    ],
+    parameters: Type.Object({
+      title: Type.String({ description: "Short plan title" }),
+      summary: Type.String({ description: "One paragraph describing what this plan accomplishes" }),
+      tasks: Type.Array(
+        Type.Object({
+          id: Type.String({ description: "Unique task identifier (kebab-case)" }),
+          action: Type.String({ description: "Concrete action with exact commands or edits. Vague verbs rejected." }),
+          target_files: Type.Array(Type.String(), { description: "Files this task touches. Empty only for discovery tasks." }),
+          verification: Type.String({ description: "How to verify. Include command or explicit manual check." }),
+        }),
+        { minItems: 1 }
+      ),
+      assumptions: Type.Array(Type.String(), { description: "What you assumed about environment, dependencies, user intent." }),
+    }),
+    async execute(_toolCallId: string, params: unknown, _signal: AbortSignal, _onUpdate: unknown, ctx: ExtensionContext) {
+      if (!state.enabled || state.phase !== "compose") {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, reason: "not_in_compose_phase" }) }] };
+      }
+      const p = params as { title: string; summary: string; tasks: Array<{ id: string; action: string; target_files: string[]; verification: string }>; assumptions: string[] };
+
+      // Client-side validation
+      const errors: string[] = [];
+      const VAGUE_RE = /^(check|verify|review|look\s+into|fix\s+stuff|investigate|tweak|adjust|improve|refactor|clean\s+up)/i;
+      for (const task of p.tasks) {
+        if (!task.id) errors.push(`Task #${p.tasks.indexOf(task) + 1}: missing id`);
+        if (!task.action) errors.push(`${task.id || "?"}: missing action`);
+        else if (VAGUE_RE.test(task.action.trim())) errors.push(`${task.id}: vague action "${task.action}" — be concrete`);
+        if ((!task.target_files || task.target_files.length === 0) && !task.id?.includes("discover") && !task.id?.includes("explore")) {
+          errors.push(`${task.id}: target_files empty — list files or mark task as discovery/explore`);
+        }
+        if (!task.verification) errors.push(`${task.id}: missing verification`);
+      }
+
+      if (errors.length > 0) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, errors }) }] };
+      }
+
+      // Render markdown
+      const tasksMd = p.tasks.map((t, i) =>
+        `| ${i + 1} | ${t.action} | ${(t.target_files || []).join(", ") || "—"} | ${t.verification} |`
+      ).join("\n");
+      const assumptionsMd = p.assumptions.map((a) => `- ${a}`).join("\n");
+      const now = new Date().toISOString();
+      const md = `# ${p.title}\n\nGenerated: ${now}\n\n## Summary\n${p.summary}\n\n## Tasks\n\n| # | Action | Files | Verification |\n|---|---|---|---|\n${tasksMd}\n\n## Assumptions\n${assumptionsMd}\n`;
+
+      // Write to .plans/current.md
+      const cwd = process.cwd();
+      const plansDir = join(cwd, ".plans");
+      mkdirSync(plansDir, { recursive: true });
+      writeFileSync(join(plansDir, "current.md"), md, "utf8");
+
+      state.latestPlan = md;
+      persistState();
+      updateUi(ctx);
+
+      // Show menu
+      setTimeout(() => {
+        if (!state.enabled || !state.latestPlan) return;
+        if (ctx.hasUI) {
+          ctx.ui.select("Plan ready — what next?", ["Implement this plan", "Stay in Plan mode"]).then((choice) => {
+            if (choice === "Implement this plan") startImplementation(ctx);
+          });
+        }
+        pi.sendMessage(
+          { customType: "proposed-plan", content: "Proposed plan ready.", display: true },
+          { triggerTurn: false },
+        );
+      }, 0);
+
+      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, taskCount: p.tasks.length }) }] };
+    },
+  });
   // ── Command: /plan ─────────────────────────────────────────────────────────
 
   pi.registerCommand("plan", {
@@ -309,56 +364,14 @@ export default function (pi: ExtensionAPI) {
     return { systemPrompt: `${event.systemPrompt}\n\n${grillPrompt()}` };
   });
 
-  // Detect proposed plan / manage compose validation
+  // Detect compose completion via submit_plan (plan already stored by tool)
   pi.on("agent_end", async (event, ctx) => {
     if (!state.enabled) return;
-    const text = latestAssistantText(event.messages);
-    const match = PROPOSED_PLAN_RE.exec(text);
 
-    if (state.phase === "grill" && match) {
-      setTimeout(() => {
-        if (!state.enabled || state.phase !== "grill") return;
-        pi.sendUserMessage("Still in grill phase. Do not write the plan yet. If uncertainty is resolved, call plan_mode_ready_to_compose; the user can also type /plan compose.", { deliverAs: "followUp" });
-      }, 0);
-      return;
+    // If compose phase ended and no plan was submitted, retry
+    if (state.phase === "compose" && !state.latestPlan) {
+      requestComposeRetry(ctx, "No plan submitted. Call the submit_plan tool with your plan.");
     }
-
-    if (!match) {
-      if (state.phase === "compose" && !state.latestPlan) {
-        requestComposeRetry(ctx, "Missing <proposed_plan>...</proposed_plan> block.");
-      }
-      return;
-    }
-
-    const plan = match[1].trim();
-    const validationError = validatePlan(plan);
-
-    if (validationError) {
-      requestComposeRetry(ctx, validationError);
-      return;
-    }
-
-    state.latestPlan = plan;
-    state.awaitingAction = true;
-    persistState();
-    updateUi(ctx);
-
-    setTimeout(async () => {
-      if (!state.enabled || !state.latestPlan) return;
-      if (ctx.hasUI) {
-        const choice = await ctx.ui.select("Plan ready — what next?", [
-          "Implement this plan",
-          "Stay in Plan mode",
-          "Exit Plan mode (discard plan)",
-        ]);
-        if (choice === "Implement this plan") startImplementation(ctx);
-        else if (choice === "Exit Plan mode (discard plan)") exitPlanMode(ctx);
-      }
-      pi.sendMessage(
-        { customType: "proposed-plan", content: `**Proposed Plan**\n\n${state.latestPlan}`, display: true },
-        { triggerTurn: false },
-      );
-    }, 0);
   });
 
   // Filter stale plan messages when not in plan mode
@@ -389,10 +402,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function startImplementation(ctx: ExtensionContext) {
-    const plan = state.latestPlan;
     exitPlanMode(ctx);
-    if (!plan) return;
-    const msg = `Plan mode is now disabled. Implement this plan:\n\n<proposed_plan>\n${plan}\n</proposed_plan>`;
+    const msg = "Read `.plans/current.md` for the full approved plan. Then execute it step by step.";
     if (ctx.isIdle()) pi.sendUserMessage(msg);
     else pi.sendUserMessage(msg, { deliverAs: "followUp" });
   }
@@ -402,7 +413,7 @@ export default function (pi: ExtensionAPI) {
     persistState();
     updateUi(ctx);
     ctx.ui.notify("Compose phase — write plan in fixed template.", "info");
-    const msg = `Proceed to write the plan using the fixed template below.\n\n${composePrompt(null)}`;
+    const msg = "Compose the plan now.";
     if (ctx.isIdle()) pi.sendUserMessage(msg);
     else pi.sendUserMessage(msg, { deliverAs: "followUp" });
   }
@@ -510,7 +521,7 @@ export default function (pi: ExtensionAPI) {
   function selectableTools(): ToolInfo[] {
     try {
       return pi.getAllTools()
-        .filter((t) => t.name !== PLAN_MODE_QUESTION_TOOL && t.name !== PLAN_MODE_READY_TOOL)
+        .filter((t) => !PLAN_ONLY_TOOLS.includes(t.name))
         .sort((a, b) => {
           const aB = isBuiltin(a), bB = isBuiltin(b);
           if (aB !== bB) return aB ? -1 : 1;
@@ -525,7 +536,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function isBlockedTool(name: string): boolean {
-    return BLOCKED_BUILTIN_NAMES.has(name) || name === PLAN_MODE_QUESTION_TOOL || name === PLAN_MODE_READY_TOOL;
+    return BLOCKED_BUILTIN_NAMES.has(name) || PLAN_ONLY_TOOLS.includes(name);
   }
 
   function isBuiltin(t: ToolInfo): boolean {
@@ -554,19 +565,19 @@ export default function (pi: ExtensionAPI) {
 
   function applySelectedTools(allTools: ToolInfo[], selectedNames: string[]) {
     const selectable = new Set(selectedNames.filter((n) => allTools.some((t) => t.name === n) && !isBlockedTool(n)));
-    const tools = [...selectable, PLAN_MODE_QUESTION_TOOL, PLAN_MODE_READY_TOOL].sort();
+    const tools = [...selectable, ...PLAN_ONLY_TOOLS].sort();
     pi.setActiveTools(tools);
   }
 
   function restoreTools() {
     const tools = toolsBeforePlan ?? state.toolsBeforePlan ?? FULL_TOOLS;
-    pi.setActiveTools(tools.filter((t) => t !== PLAN_MODE_QUESTION_TOOL && t !== PLAN_MODE_READY_TOOL));
+    pi.setActiveTools(tools.filter((t) => !PLAN_ONLY_TOOLS.includes(t)));
     toolsBeforePlan = undefined;
   }
 
   function removePlanQuestionTool() {
     const active = safeGetActiveTools();
-    const filtered = active.filter((t) => t !== PLAN_MODE_QUESTION_TOOL && t !== PLAN_MODE_READY_TOOL);
+    const filtered = active.filter((t) => !PLAN_ONLY_TOOLS.includes(t));
     if (filtered.length !== active.length) pi.setActiveTools(filtered);
   }
 
@@ -587,7 +598,7 @@ export default function (pi: ExtensionAPI) {
       if (!state.enabled || state.phase !== "compose") return;
       ctx.ui.notify(`Plan validation: ${validationError}. Retrying...`, "warning");
       pi.sendUserMessage(
-        `The plan was incomplete. Fix this issue and rewrite with the exact template below.\n\n${composePrompt(validationError)}`, 
+        `The plan was incomplete: ${validationError}. Rewrite using the exact template from the compose-phase instructions.`,
         { deliverAs: "followUp" },
       );
     }, 0);
