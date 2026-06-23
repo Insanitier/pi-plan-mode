@@ -30,6 +30,7 @@ const WIDGET_KEY = "plan-mode";
 const PLAN_MODE_QUESTION_TOOL = "plan_mode_question";
 const PLAN_MODE_READY_TOOL = "plan_mode_ready_to_compose";
 const PLAN_ONLY_TOOLS = [PLAN_MODE_QUESTION_TOOL, PLAN_MODE_READY_TOOL, "submit_plan"];
+const UPDATE_PLAN_TASK_TOOL = "update_plan_task";
 const TOOL_SELECTOR_PAGE_SIZE = 10;
 const GRILLING_SKILL_PATH = join(homedir(), ".pi", "agent", "skills", "grilling", "SKILL.md");
 
@@ -259,11 +260,17 @@ export default function (pi: ExtensionAPI) {
       const now = new Date().toISOString();
       const md = `# ${p.title}\n\nGenerated: ${now}\n\n## Summary\n${p.summary}\n\n## Tasks\n\n| # | Action | Files | Verification |\n|---|---|---|---|\n${tasksMd}\n\n## Assumptions\n${assumptionsMd}\n`;
 
-      // Write to .plans/current.md
+      // Write to .plans/current.md (human-readable handoff)
       const cwd = process.cwd();
       const plansDir = join(cwd, ".plans");
       mkdirSync(plansDir, { recursive: true });
       writeFileSync(join(plansDir, "current.md"), md, "utf8");
+
+      // Write .plans/current.tasks.jsonl — source of truth for task status
+      const tasksJsonl = p.tasks.map((t) =>
+        JSON.stringify({ id: t.id, status: "pending", action: t.action, target_files: t.target_files, verification: t.verification })
+      ).join("\n") + "\n";
+      writeFileSync(join(plansDir, "current.tasks.jsonl"), tasksJsonl, "utf8");
 
       state.latestPlan = md;
       persistState();
@@ -274,7 +281,7 @@ export default function (pi: ExtensionAPI) {
         if (!state.enabled || !state.latestPlan) return;
         if (ctx.hasUI) {
           ctx.ui.select("Plan ready — what next?", ["Implement this plan", "Stay in Plan mode"]).then((choice) => {
-            if (choice === "Implement this plan") startImplementation(ctx);
+        if (choice === "Implement this plan") startImplementation(ctx);
           });
         }
         pi.sendMessage(
@@ -286,6 +293,77 @@ export default function (pi: ExtensionAPI) {
       return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, taskCount: p.tasks.length }) }] };
     },
   });
+
+  // ── Tool: update_plan_task (update task status in JSONL ledger) ─────────────
+  // ponytail: JSONL file read/write is fine at plan-scale task counts (<100).
+  // Upgrade: switch to append-only log + compaction if task counts grow.
+
+  pi.registerTool({
+    name: UPDATE_PLAN_TASK_TOOL,
+    label: "Update plan task",
+    description: "Update a task's status in .plans/current.tasks.jsonl. Available during and after plan execution.",
+    promptSnippet: "Track implementation progress by updating task statuses",
+    promptGuidelines: [
+      "Call update_plan_task after completing, starting, skipping, or blocking each task.",
+      "Valid statuses: pending, in_progress, done, skipped, blocked.",
+      "Update status promptly — the JSONL ledger is the source of truth.",
+    ],
+    parameters: Type.Object({
+      task_id: Type.String({ description: "Task identifier from the plan (kebab-case)" }),
+      status: Type.Union(
+        [
+          Type.Literal("pending"),
+          Type.Literal("in_progress"),
+          Type.Literal("done"),
+          Type.Literal("skipped"),
+          Type.Literal("blocked"),
+        ],
+        { description: "New status for the task" }
+      ),
+    }),
+    async execute(_toolCallId: string, params: unknown) {
+      const { task_id, status } = params as { task_id: string; status: string };
+      const validStatuses = new Set(["pending", "in_progress", "done", "skipped", "blocked"]);
+      if (!task_id || !validStatuses.has(status)) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, reason: "invalid_input" }) }] };
+      }
+
+      const jsonlPath = join(process.cwd(), ".plans", "current.tasks.jsonl");
+      let lines: string[];
+      try {
+        const raw = readFileSync(jsonlPath, "utf8");
+        lines = raw.split("\n").filter((l) => l.trim());
+      } catch {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, reason: "no_plan_active" }) }] };
+      }
+
+      let found = false;
+      const updated = lines.map((line) => {
+        const task = JSON.parse(line);
+        if (task.id === task_id) {
+          found = true;
+          task.status = status;
+        }
+        return JSON.stringify(task);
+      });
+
+      if (!found) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, reason: `task "${task_id}" not found` }) }] };
+      }
+
+      writeFileSync(jsonlPath, updated.join("\n") + "\n", "utf8");
+
+      // Summary: count statuses for feedback
+      const counts: Record<string, number> = {};
+      for (const line of updated) {
+        const s = (JSON.parse(line) as { status: string }).status;
+        counts[s] = (counts[s] ?? 0) + 1;
+      }
+
+      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, task_id, status, summary: counts }) }] };
+    },
+  });
+
   // ── Command: /plan ─────────────────────────────────────────────────────────
 
   pi.registerCommand("plan", {
@@ -403,7 +481,12 @@ export default function (pi: ExtensionAPI) {
 
   function startImplementation(ctx: ExtensionContext) {
     exitPlanMode(ctx);
-    const msg = "Read `.plans/current.md` for the full approved plan. Then execute it step by step.";
+    // Keep update_plan_task active for task tracking during execution
+    const active = safeGetActiveTools();
+    if (!active.includes(UPDATE_PLAN_TASK_TOOL)) {
+      pi.setActiveTools([...active, UPDATE_PLAN_TASK_TOOL]);
+    }
+    const msg = "Read `.plans/current.tasks.jsonl` for the task ledger (source of truth) and `.plans/current.md` for the human-readable plan. Execute tasks step by step. Update task status with `update_plan_task` as you go — start each task with in_progress, then done/skipped/blocked.";
     if (ctx.isIdle()) pi.sendUserMessage(msg);
     else pi.sendUserMessage(msg, { deliverAs: "followUp" });
   }
@@ -412,7 +495,7 @@ export default function (pi: ExtensionAPI) {
     state.phase = "compose";
     persistState();
     updateUi(ctx);
-    ctx.ui.notify("Compose phase — write plan in fixed template.", "info");
+    ctx.ui.notify("Compose phase — submit structured plan.", "info");
     const msg = "Compose the plan now.";
     if (ctx.isIdle()) pi.sendUserMessage(msg);
     else pi.sendUserMessage(msg, { deliverAs: "followUp" });
@@ -447,12 +530,10 @@ export default function (pi: ExtensionAPI) {
   async function showPlanMenu(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
     const options = state.latestPlan
-      ? ["Show plan", "Implement this plan", "Configure tools", "Stay in Plan mode", "Exit Plan mode"]
+      ? ["Implement this plan", "Stay in Plan mode"]
       : ["Compose plan", "Configure tools", "Stay in Plan mode", "Exit Plan mode"];
     const choice = await ctx.ui.select(state.latestPlan ? "Plan ready. What next?" : "What next?", options);
-    if (choice === "Show plan" && state.latestPlan) {
-      ctx.ui.notify(state.latestPlan, "info");
-    } else if (choice === "Implement this plan") {
+    if (choice === "Implement this plan") {
       startImplementation(ctx);
     } else if (choice === "Compose plan") {
       beginCompose(ctx);
@@ -571,7 +652,8 @@ export default function (pi: ExtensionAPI) {
 
   function restoreTools() {
     const tools = toolsBeforePlan ?? state.toolsBeforePlan ?? FULL_TOOLS;
-    pi.setActiveTools(tools.filter((t) => !PLAN_ONLY_TOOLS.includes(t)));
+    const restored = tools.filter((t) => !PLAN_ONLY_TOOLS.includes(t));
+    pi.setActiveTools(restored);
     toolsBeforePlan = undefined;
   }
 
